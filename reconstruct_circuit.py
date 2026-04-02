@@ -56,10 +56,11 @@ def build_bound_circuit(alpha_angles: np.ndarray, beta_angles: np.ndarray,
     y_qubit = num_address_qubits + 1
 
     # QCrank: H on address qubits, then uniformly controlled Ry on data qubits.
-    # UCRYGate takes a list of 2^n floats; qubit order is [target] + controls.
+    # UCRYGate qubit order is [target] + controls, with controls in LSB-first
+    # (little-endian) order — so we reverse address_qubits.
     qc.h(address_qubits)
-    qc.append(UCRYGate([float(a) for a in alpha_angles]), [x_qubit] + address_qubits)
-    qc.append(UCRYGate([float(b) for b in beta_angles]),  [y_qubit] + address_qubits)
+    qc.append(UCRYGate([float(a) for a in alpha_angles]), [x_qubit] + list(reversed(address_qubits)))
+    qc.append(UCRYGate([float(b) for b in beta_angles]),  [y_qubit] + list(reversed(address_qubits)))
 
     # EHands block
     qc.barrier()
@@ -119,20 +120,28 @@ def verify_against_metadata(qc, transpile_md: dict):
 
 def transpile_and_compare(qc, transpile_md: dict):
     """
-    Transpile the reconstructed circuit with optimization_level=3 on a generic
-    7-qubit backend (matching IBM Kingston's qubit count) and compare gate stats
-    to the h5 transpile metadata. This is the apples-to-apples comparison.
+    Transpile the reconstructed circuit using FakeWashingtonV2 (127-qubit Eagle r3
+    processor — same topology as ibm_kingston) with the exact initial_layout stored
+    in the h5 metadata, at optimization_level=3.
+    This is the closest achievable apples-to-apples comparison.
     """
     from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
-    from qiskit.providers.fake_provider import GenericBackendV2
+    from qiskit_ibm_runtime.fake_provider import FakeWashingtonV2
 
-    num_qubits = qc.num_qubits
-    print(f"\nTranspiling with optimization_level=3 on a {num_qubits}-qubit generic backend...")
-    print("(This may take a minute for large circuits)")
+    # FakeWashingtonV2: 127-qubit Eagle r3, same chip topology as ibm_kingston
+    backend = FakeWashingtonV2()
+    phys_qubits = transpile_md.get('phys_qubits')  # e.g. [83, 82, 105, 102, 104, 103, 96]
 
-    # Build a fully-connected fake backend with the same qubit count as the real job
-    backend = GenericBackendV2(num_qubits=num_qubits)
-    pm = generate_preset_pass_manager(optimization_level=3, backend=backend)
+    print(f"\nTranspiling on FakeWashingtonV2 (127-qubit Eagle r3, ~= ibm_kingston)")
+    print(f"  initial_layout = {phys_qubits}  (from h5 metadata)")
+    print("  optimization_level = 3")
+    print("  (This may take a minute)")
+
+    pm = generate_preset_pass_manager(
+        optimization_level=3,
+        backend=backend,
+        initial_layout=phys_qubits
+    )
     qc_t = pm.run(qc)
 
     # Count 2q gates in the transpiled circuit
@@ -141,7 +150,7 @@ def transpile_and_compare(qc, transpile_md: dict):
     n2q = sum(v for k, v in ops_t.items() if k in two_q_names)
     depth_2q = qc_t.depth(filter_function=lambda x: x.operation.num_qubits == 2)
 
-    print("\n-- Transpiled circuit (optimization_level=3) --------")
+    print("\n-- Transpiled circuit (FakeWashington, opt=3) --------")
     print(f"  Depth (total)   : {qc_t.depth()}")
     print(f"  2q gate depth   : {depth_2q}")
     print(f"  2q gate count   : {n2q}")
@@ -150,17 +159,78 @@ def transpile_and_compare(qc, transpile_md: dict):
     print("\n-- H5 transpile metadata (ran on ibm_kingston) ------")
     pprint(transpile_md)
 
-    # Compare key stats
     h5_2q_count = transpile_md.get('2q_gate_count', '?')
     h5_2q_depth = transpile_md.get('2q_gate_depth', '?')
     print("\n-- Comparison ---")
     print(f"  2q gate count : reconstructed={n2q}  h5={h5_2q_count}")
     print(f"  2q gate depth : reconstructed={depth_2q}  h5={h5_2q_depth}")
     print()
-    print("  If counts are in the same ballpark, the circuits match.")
-    print("  Exact equality is not expected: different backend topology")
-    print("  and random_compilation on the original run both affect counts.")
+    print("  Note: random_compilation=True on the original run adds extra gates;")
+    print("  exact equality is not expected even with the same topology.")
     return qc_t
+
+
+def equiv_check(inp_udata: np.ndarray, nq_addr: int, sample_idx: int):
+    """
+    Build the same circuit using both UCRYGate and naive mcry, then compare
+    their unitaries with Operator.equiv (checks equality up to global phase).
+    Proves the two decompositions implement the same quantum operation.
+
+    NOTE: measurements are removed before computing the operator, since
+    Operator only supports unitary (measurement-free) circuits.
+    """
+    from qiskit import QuantumCircuit
+    from qiskit.quantum_info import Operator
+    from qiskit.circuit.library import UCRYGate
+
+    num_pairs = 2 ** nq_addr
+    x_vals = inp_udata[:, 0, sample_idx]
+    y_vals = inp_udata[:, 1, sample_idx]
+    alpha  = values_to_angles(x_vals)
+    beta   = values_to_angles(y_vals)
+
+    # ── Circuit A: UCRYGate (our reconstruction) ──────────────────────────────
+    qc_ucry = build_bound_circuit(alpha, beta, nq_addr)
+
+    # ── Circuit B: naive multi-controlled Ry ─────────────────────────────────
+    num_total = nq_addr + 2
+    qc_mcry = QuantumCircuit(num_total)
+    addr = list(range(nq_addr))
+    xq, yq = nq_addr, nq_addr + 1
+    qc_mcry.h(addr)
+    for l in range(num_pairs):
+        bits = format(l, f"0{nq_addr}b")
+        for q, b in zip(addr, bits):
+            if b == "0": qc_mcry.x(q)
+        qc_mcry.mcry(float(alpha[l]), q_controls=addr, q_target=xq,
+                     q_ancillae=[], mode="noancilla")
+        qc_mcry.mcry(float(beta[l]),  q_controls=addr, q_target=yq,
+                     q_ancillae=[], mode="noancilla")
+        for q, b in zip(addr, bits):
+            if b == "0": qc_mcry.x(q)
+    qc_mcry.cx(xq, yq)
+    qc_mcry.rz(np.pi / 2, yq)
+
+    # Strip measurements (Operator requires unitary circuits)
+    def remove_meas(qc):
+        return qc.copy().remove_final_measurements(inplace=False)
+
+    qc_a = remove_meas(qc_ucry)
+    qc_b = qc_mcry  # mcry version has no measurements
+
+    print(f"\nComputing Operator for UCRYGate circuit  ({qc_a.num_qubits} qubits, 2^n={2**qc_a.num_qubits} dim)...")
+    op_a = Operator(qc_a)
+    print("Computing Operator for naive mcry circuit...")
+    op_b = Operator(qc_b)
+
+    result = op_a.equiv(op_b)
+    print(f"\nOperator.equiv(UCRYGate, mcry) = {result}")
+    if result:
+        print("  The two circuits implement the SAME unitary (up to global phase).")
+        print("  The UCRYGate reconstruction is correct.")
+    else:
+        print("  WARNING: unitaries differ — circuits are NOT equivalent.")
+    return result
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -174,10 +244,12 @@ def main():
                         help="Reconstruct all samples and print a summary")
     parser.add_argument("--draw",     action="store_true",
                         help="Print the circuit diagram (text)")
-    parser.add_argument("--verify",   action="store_true",
+    parser.add_argument("--verify",    action="store_true",
                         help="Show logical circuit stats vs h5 metadata (pre-transpile)")
     parser.add_argument("--transpile", action="store_true",
-                        help="Transpile with opt-level 3 and compare gate counts to h5 (slow)")
+                        help="Transpile on FakeWashington w/ stored initial_layout, compare to h5 (slow)")
+    parser.add_argument("--equiv",     action="store_true",
+                        help="Prove UCRYGate == naive mcry via Operator.equiv (slow for large nq_addr)")
     args = parser.parse_args()
 
     # ── Load H5 ──────────────────────────────────────────────────────────────
@@ -223,6 +295,9 @@ def main():
 
     if args.transpile:
         transpile_and_compare(qc, metaD.get('transpile', {}))
+
+    if args.equiv:
+        equiv_check(inp_udata, nq_addr, s)
 
     return qc
 
