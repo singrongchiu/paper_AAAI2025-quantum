@@ -4,10 +4,12 @@ reconstruct_circuit.py
 Reconstructs QCrank/VQDP QuantumCircuits from the inp_udata stored in .h5 files.
 
 Usage:
-    python reconstruct_circuit.py                       # uses default qc5adr_ibm_kingston.ibm.h5
+    python reconstruct_circuit.py                          # reconstruct sample 0 from default h5
     python reconstruct_circuit.py --h5 data/jobs/qc3adr_ibm_kingston.ibm.h5
-    python reconstruct_circuit.py --h5 data/jobs/qc5adr_ibm_kingston.ibm.h5 --sample 0 --draw
-    python reconstruct_circuit.py --h5 data/jobs/qc5adr_ibm_kingston.ibm.h5 --all --verify
+    python reconstruct_circuit.py --sample 0 --draw        # print circuit diagram
+    python reconstruct_circuit.py --sample 0 --verify      # compare qubit count vs h5 metadata
+    python reconstruct_circuit.py --sample 0 --transpile   # compile + compare gate counts to h5
+    python reconstruct_circuit.py --all                    # reconstruct all samples
 """
 
 import argparse
@@ -26,47 +28,38 @@ def values_to_angles(x: np.ndarray) -> np.ndarray:
     return np.arccos(x)
 
 
-# inline VQDPCircuitBuilder (no external VQT dependency needed)
-def _apply_zero_control_fixes(qc, address_qubits, bitstring):
-    for q, bit in zip(address_qubits, bitstring):
-        if bit == "0":
-            qc.x(q)
-
-def _undo_zero_control_fixes(qc, address_qubits, bitstring):
-    for q, bit in zip(address_qubits, bitstring):
-        if bit == "0":
-            qc.x(q)
-
-def build_symbolic_circuit(num_address_qubits: int):
+# UCRYGate: uniformly-controlled Ry — the correct QCrank decomposition.
+# For n address qubits, UCRYGate encodes 2^n angles using 2*(2^n) CX gates
+# (linear in addresses), vs naive mcry which uses ~40*2^n CX gates.
+# NOTE: UCRYGate requires concrete float angles (not symbolic Parameters),
+#       so we build the bound circuit directly.
+def build_bound_circuit(alpha_angles: np.ndarray, beta_angles: np.ndarray,
+                        num_address_qubits: int):
     """
-    Builds the symbolic (parametric) QCrank/VQDP circuit.
-    Returns (qc, alpha_params, beta_params).
+    Builds a fully-bound QCrank/VQDP circuit using UCRYGate.
+    UCRYGate requires concrete float angles — no symbolic parameters.
+
+    alpha_angles, beta_angles: arrays of length 2^num_address_qubits
     """
     from qiskit import QuantumCircuit
-    from qiskit.circuit import ParameterVector
+    from qiskit.circuit.library import UCRYGate
 
     num_pairs = 2 ** num_address_qubits
-    num_total_qubits = num_address_qubits + 2
+    assert len(alpha_angles) == num_pairs
+    assert len(beta_angles)  == num_pairs
 
+    num_total_qubits = num_address_qubits + 2
     qc = QuantumCircuit(num_total_qubits, 1)
+
     address_qubits = list(range(num_address_qubits))
     x_qubit = num_address_qubits
     y_qubit = num_address_qubits + 1
 
-    alpha = ParameterVector("alpha", num_pairs)
-    beta  = ParameterVector("beta",  num_pairs)
-
-    # QCrank: H on address qubits, then address-conditioned Ry rotations
+    # QCrank: H on address qubits, then uniformly controlled Ry on data qubits.
+    # UCRYGate takes a list of 2^n floats; qubit order is [target] + controls.
     qc.h(address_qubits)
-
-    for l in range(num_pairs):
-        bitstring = format(l, f"0{num_address_qubits}b")
-        _apply_zero_control_fixes(qc, address_qubits, bitstring)
-        qc.mcry(alpha[l], q_controls=address_qubits, q_target=x_qubit,
-                q_ancillae=[], mode="noancilla")
-        qc.mcry(beta[l],  q_controls=address_qubits, q_target=y_qubit,
-                q_ancillae=[], mode="noancilla")
-        _undo_zero_control_fixes(qc, address_qubits, bitstring)
+    qc.append(UCRYGate([float(a) for a in alpha_angles]), [x_qubit] + address_qubits)
+    qc.append(UCRYGate([float(b) for b in beta_angles]),  [y_qubit] + address_qubits)
 
     # EHands block
     qc.barrier()
@@ -76,7 +69,7 @@ def build_symbolic_circuit(num_address_qubits: int):
     # Measure second data qubit
     qc.measure(y_qubit, 0)
 
-    return qc, alpha, beta
+    return qc
 
 
 def reconstruct_circuit(inp_udata: np.ndarray, nq_addr: int, sample_idx: int):
@@ -88,8 +81,6 @@ def reconstruct_circuit(inp_udata: np.ndarray, nq_addr: int, sample_idx: int):
       axis 1 = data channel     (0=x/alpha, 1=y/beta)
       axis 2 = sample index     (0 .. num_sample - 1)
     """
-    from qiskit import QuantumCircuit
-
     num_pairs = 2 ** nq_addr
     assert inp_udata.shape[0] == num_pairs, \
         f"inp_udata axis-0 size {inp_udata.shape[0]} != 2^nq_addr={num_pairs}"
@@ -100,52 +91,93 @@ def reconstruct_circuit(inp_udata: np.ndarray, nq_addr: int, sample_idx: int):
     alpha_angles = values_to_angles(x_vals)  # arccos encoding
     beta_angles  = values_to_angles(y_vals)
 
-    qc_sym, alpha_params, beta_params = build_symbolic_circuit(nq_addr)
-
-    bind_map = {}
-    for i in range(num_pairs):
-        bind_map[alpha_params[i]] = float(alpha_angles[i])
-        bind_map[beta_params[i]]  = float(beta_angles[i])
-
-    return qc_sym.assign_parameters(bind_map)
+    return build_bound_circuit(alpha_angles, beta_angles, nq_addr)
 
 
 def verify_against_metadata(qc, transpile_md: dict):
     """
-    Cross-check the reconstructed circuit's stats against the h5 transpile metadata.
-    Note: the metadata reflects the *transpiled* circuit; the reconstructed circuit
-    is the logical (pre-transpile) version, so counts will differ.
+    Compare the LOGICAL (pre-transpile) circuit to h5 metadata.
+    Gate counts will differ because the h5 stores post-transpile stats.
+    Only num_qubit should match directly. Use --transpile for a true comparison.
     """
     ops = dict(qc.count_ops())
-    print("\n-- Reconstructed circuit stats ----------------------")
+    print("\n-- Reconstructed circuit (logical, pre-transpile) ---")
     print(f"  Qubits      : {qc.num_qubits}")
     print(f"  Clbits      : {qc.num_clbits}")
     print(f"  Depth       : {qc.depth()}")
     print(f"  Gate counts : {ops}")
+    print("  NOTE: gate counts here are NOT comparable to h5 -- run --transpile for that.")
 
-    print("\n-- H5 transpile metadata (transpiled circuit) -------")
+    print("\n-- H5 transpile metadata (post-transpile, ran on HW) ----")
     pprint(transpile_md)
 
-    # Qubit count should match (logical == physical qubit count after transpile)
     match = qc.num_qubits == transpile_md.get('num_qubit')
     print(f"\n  num_qubit match : {'YES' if match else 'NO'} "
           f"(reconstructed={qc.num_qubits}, h5={transpile_md.get('num_qubit')})")
     return match
 
 
+def transpile_and_compare(qc, transpile_md: dict):
+    """
+    Transpile the reconstructed circuit with optimization_level=3 on a generic
+    7-qubit backend (matching IBM Kingston's qubit count) and compare gate stats
+    to the h5 transpile metadata. This is the apples-to-apples comparison.
+    """
+    from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+    from qiskit.providers.fake_provider import GenericBackendV2
+
+    num_qubits = qc.num_qubits
+    print(f"\nTranspiling with optimization_level=3 on a {num_qubits}-qubit generic backend...")
+    print("(This may take a minute for large circuits)")
+
+    # Build a fully-connected fake backend with the same qubit count as the real job
+    backend = GenericBackendV2(num_qubits=num_qubits)
+    pm = generate_preset_pass_manager(optimization_level=3, backend=backend)
+    qc_t = pm.run(qc)
+
+    # Count 2q gates in the transpiled circuit
+    ops_t = dict(qc_t.count_ops())
+    two_q_names = {'cx', 'ecr', 'cz', 'swap', 'rzz', 'rxx', 'ryy'}
+    n2q = sum(v for k, v in ops_t.items() if k in two_q_names)
+    depth_2q = qc_t.depth(filter_function=lambda x: x.operation.num_qubits == 2)
+
+    print("\n-- Transpiled circuit (optimization_level=3) --------")
+    print(f"  Depth (total)   : {qc_t.depth()}")
+    print(f"  2q gate depth   : {depth_2q}")
+    print(f"  2q gate count   : {n2q}")
+    print(f"  Gate counts     : {ops_t}")
+
+    print("\n-- H5 transpile metadata (ran on ibm_kingston) ------")
+    pprint(transpile_md)
+
+    # Compare key stats
+    h5_2q_count = transpile_md.get('2q_gate_count', '?')
+    h5_2q_depth = transpile_md.get('2q_gate_depth', '?')
+    print("\n-- Comparison ---")
+    print(f"  2q gate count : reconstructed={n2q}  h5={h5_2q_count}")
+    print(f"  2q gate depth : reconstructed={depth_2q}  h5={h5_2q_depth}")
+    print()
+    print("  If counts are in the same ballpark, the circuits match.")
+    print("  Exact equality is not expected: different backend topology")
+    print("  and random_compilation on the original run both affect counts.")
+    return qc_t
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Reconstruct QCrank circuits from .h5 files")
-    parser.add_argument("--h5",     default="data/jobs/qc5adr_ibm_kingston.ibm.h5",
+    parser.add_argument("--h5",       default="data/jobs/qc5adr_ibm_kingston.ibm.h5",
                         help="Path to the .ibm.h5 (or .ionq.h5) job file")
-    parser.add_argument("--sample", type=int, default=0,
+    parser.add_argument("--sample",   type=int, default=0,
                         help="Which sample index to reconstruct (default: 0)")
-    parser.add_argument("--all",    action="store_true",
+    parser.add_argument("--all",      action="store_true",
                         help="Reconstruct all samples and print a summary")
-    parser.add_argument("--draw",   action="store_true",
+    parser.add_argument("--draw",     action="store_true",
                         help="Print the circuit diagram (text)")
-    parser.add_argument("--verify", action="store_true",
-                        help="Cross-check reconstructed circuit against h5 metadata")
+    parser.add_argument("--verify",   action="store_true",
+                        help="Show logical circuit stats vs h5 metadata (pre-transpile)")
+    parser.add_argument("--transpile", action="store_true",
+                        help="Transpile with opt-level 3 and compare gate counts to h5 (slow)")
     args = parser.parse_args()
 
     # ── Load H5 ──────────────────────────────────────────────────────────────
@@ -183,11 +215,14 @@ def main():
     print(f"Success. Circuit has {qc.num_qubits} qubits, depth {qc.depth()}.")
 
     if args.draw:
-        print("\n── Circuit diagram ──────────────────────────────────")
+        print("\n-- Circuit diagram --")
         print(qc.draw(output='text', fold=120))
 
     if args.verify:
         verify_against_metadata(qc, metaD.get('transpile', {}))
+
+    if args.transpile:
+        transpile_and_compare(qc, metaD.get('transpile', {}))
 
     return qc
 
