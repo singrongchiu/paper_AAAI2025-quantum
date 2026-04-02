@@ -1,5 +1,6 @@
-h5py==3.13.0
-matplotlib==3.10.3
-numpy==2.3.1
-PyYAML==6.0.2
-qiskit==2.1.0
+h5py==3.16.0
+matplotlib==3.10.6
+numpy==2.3.3
+PyYAML==6.0.3
+qiskit==2.3.1
+qiskit-ibm-runtime==0.46.1
